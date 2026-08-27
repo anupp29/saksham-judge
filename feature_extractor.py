@@ -1,16 +1,18 @@
 """
-Feature extraction pipeline — mirrors the training notebook exactly.
+Feature extraction — mirrors training notebook exactly.
 
-YOLO keypoint index map (17 points, each with x, y, conf → 51 values):
-  0 Nose   1 LeftEye  2 RightEye  3 LeftEar   4 RightEar
-  5 LShoulder 6 RShoulder 7 LElbow 8 RElbow
-  9 LWrist  10 RWrist  11 LHip  12 RHip  13 LKnee  14 RKnee
-  15 LAnkle  16 RAnkle
+COCO-17 keypoint order (what YOLO was trained on):
+  0 Nose  1 LEye  2 REye  3 LEar  4 REar
+  5 LShoulder  6 RShoulder  7 LElbow  8 RElbow
+  9 LWrist  10 RWrist  11 LHip  12 RHip
+  13 LKnee  14 RKnee  15 LAnkle  16 RAnkle
 
-Per-frame feature vector (63 dims):
-  keypoints.flatten()   → 51  (17 × 3)
-  bounding_box          →  4
-  motion_metrics        →  8  (speed, distance, l_ext, r_ext, power, guard, align, stance)
+MediaPipe Pose returns 33 landmarks. Correct mapping to COCO-17:
+  MP index → COCO index
+  0→0, 2→1, 5→2, 7→3, 8→4,
+  11→5, 12→6, 13→7, 14→8,
+  15→9, 16→10, 23→11, 24→12,
+  25→13, 26→14, 27→15, 28→16
 """
 
 from __future__ import annotations
@@ -18,12 +20,14 @@ from collections import deque
 from typing import Optional
 import numpy as np
 
-SEQUENCE_LENGTH = 16          # must match training
-FEATURE_DIM = 63             # 51 + 4 + 8
-KP_CONF_THRESHOLD = 0.3
+SEQUENCE_LENGTH   = 16
+FEATURE_DIM       = 63        # 51 kp + 4 bbox + 8 motion
+KP_CONF_THRESHOLD = 0.4
 
-# Boxing action class names — order must match label_encoder.classes_ used at training.
-# Edit this list only if you know the exact class order from your training run.
+# Minimum wrist speed (normalised units/frame) to count as a punch motion.
+# Below this → buffer keeps filling but prediction is suppressed → no gibberish.
+MOTION_GATE = 0.008
+
 CLASS_NAMES = [
     "body_hook_left",
     "body_hook_right",
@@ -35,112 +39,106 @@ CLASS_NAMES = [
     "uppercut_right",
 ]
 
+# MediaPipe 33-point → COCO 17-point index map
+MP_TO_COCO_17 = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+
+
+def mp33_to_coco17(mp_landmarks: list, img_w: int, img_h: int) -> np.ndarray:
+    """
+    Convert MediaPipe 33-landmark list to COCO-17 (17,3) array in pixel coords.
+    mp_landmarks: list of objects with .x .y .visibility (normalised 0-1)
+    """
+    kp = np.zeros((17, 3), dtype=np.float32)
+    for coco_idx, mp_idx in enumerate(MP_TO_COCO_17):
+        lm = mp_landmarks[mp_idx]
+        kp[coco_idx] = [lm.x * img_w, lm.y * img_h, lm.visibility]
+    return kp
+
 
 def _valid(kp: np.ndarray, idx: int) -> bool:
-    """True when the keypoint at index `idx` has confidence above threshold."""
-    return kp[idx, 2] > KP_CONF_THRESHOLD
+    return bool(kp[idx, 2] > KP_CONF_THRESHOLD)
 
 
-def _calculate_motion_metrics(
-    current_kp: Optional[np.ndarray],  # shape (17, 3)
-    prev_kp: Optional[np.ndarray],
-) -> list[float]:
-    """
-    Returns [speed, distance, l_arm_ext, r_arm_ext, power_index,
-             guard_height, body_alignment, stance_width]
-    """
-    metrics = [0.0] * 8
-
-    if current_kp is None or prev_kp is None:
-        return metrics
-
+def _motion_metrics(cur: np.ndarray, prev: Optional[np.ndarray]) -> list[float]:
+    m = [0.0] * 8
+    if prev is None:
+        return m
     try:
-        # -- movement
-        if _valid(current_kp, 0) and _valid(prev_kp, 0):
-            disp = current_kp[0, :2] - prev_kp[0, :2]
-            dist = float(np.linalg.norm(disp))
-            metrics[0] = dist * 50.0   # speed  (assuming ~50 fps)
-            metrics[1] = dist          # distance
-
-        # -- left arm extension (shoulder 5 → wrist 9)
-        if _valid(current_kp, 5) and _valid(current_kp, 9):
-            metrics[2] = float(np.linalg.norm(current_kp[9, :2] - current_kp[5, :2]))
-
-        # -- right arm extension (shoulder 6 → wrist 10)
-        if _valid(current_kp, 6) and _valid(current_kp, 10):
-            metrics[3] = float(np.linalg.norm(current_kp[10, :2] - current_kp[6, :2]))
-
-        # -- power index
-        metrics[4] = max(metrics[2], metrics[3]) * metrics[0]
-
-        # -- guard height (wrist avg height relative to nose)
-        if _valid(current_kp, 0) and _valid(current_kp, 9) and _valid(current_kp, 10):
-            wrist_y = (current_kp[9, 1] + current_kp[10, 1]) / 2.0
-            metrics[5] = float(wrist_y - current_kp[0, 1])
-
-        # -- body alignment (dot product of shoulder & hip vectors, normalised)
-        if all(_valid(current_kp, i) for i in [5, 6, 11, 12]):
-            sv = current_kp[6, :2] - current_kp[5, :2]
-            hv = current_kp[12, :2] - current_kp[11, :2]
-            norms = np.linalg.norm(sv) * np.linalg.norm(hv)
-            if norms > 1e-8:
-                metrics[6] = float(abs(np.dot(sv, hv) / norms))
-
-        # -- stance width (ankle distance)
-        if _valid(current_kp, 15) and _valid(current_kp, 16):
-            metrics[7] = float(np.linalg.norm(current_kp[16, :2] - current_kp[15, :2]))
-
+        # speed / distance (nose)
+        if _valid(cur, 0) and _valid(prev, 0):
+            d = float(np.linalg.norm(cur[0, :2] - prev[0, :2]))
+            m[0] = d * 50.0
+            m[1] = d
+        # arm extensions
+        if _valid(cur, 5) and _valid(cur, 9):
+            m[2] = float(np.linalg.norm(cur[9, :2] - cur[5, :2]))
+        if _valid(cur, 6) and _valid(cur, 10):
+            m[3] = float(np.linalg.norm(cur[10, :2] - cur[6, :2]))
+        m[4] = max(m[2], m[3]) * m[0]
+        # guard height
+        if _valid(cur, 0) and _valid(cur, 9) and _valid(cur, 10):
+            m[5] = float((cur[9,1] + cur[10,1]) / 2.0 - cur[0,1])
+        # body alignment
+        if all(_valid(cur, i) for i in [5,6,11,12]):
+            sv = cur[6,:2] - cur[5,:2]
+            hv = cur[12,:2] - cur[11,:2]
+            n = np.linalg.norm(sv) * np.linalg.norm(hv)
+            if n > 1e-8:
+                m[6] = float(abs(np.dot(sv, hv) / n))
+        # stance width
+        if _valid(cur, 15) and _valid(cur, 16):
+            m[7] = float(np.linalg.norm(cur[16,:2] - cur[15,:2]))
     except Exception:
         pass
-
-    return metrics
+    return m
 
 
 class FeatureBuffer:
-    """
-    Maintains a sliding window of feature vectors and builds
-    (1, SEQUENCE_LENGTH, FEATURE_DIM) tensors ready for the LSTM.
-    """
-
     def __init__(self, seq_len: int = SEQUENCE_LENGTH):
-        self.seq_len = seq_len
-        self._buf: deque[list[float]] = deque(maxlen=seq_len)
-        self._prev_kp: Optional[np.ndarray] = None
+        self.seq_len   = seq_len
+        self._buf      : deque[list[float]] = deque(maxlen=seq_len)
+        self._prev_kp  : Optional[np.ndarray] = None
+        self._wrist_spd: float = 0.0   # tracked for motion gate
 
     def reset(self):
         self._buf.clear()
-        self._prev_kp = None
+        self._prev_kp  = None
+        self._wrist_spd = 0.0
 
     def push(self, kp_flat: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
         """
-        kp_flat : (51,)  — raw YOLO keypoints flattened (x,y,conf × 17)
-        bbox    : (4,)   — [x1, y1, x2, y2] in pixel coords (normalise if needed)
-        Returns (1, seq_len, 63) float32 array when the buffer is full, else None.
+        kp_flat : (51,) normalised
+        bbox    : (4,)  normalised
+        Returns (1, seq_len, 63) only when buffer full AND motion detected.
         """
-        # Reshape for metric calculation
         kp = kp_flat.reshape(17, 3)
+        motion = _motion_metrics(kp, self._prev_kp)
 
-        motion = _calculate_motion_metrics(kp, self._prev_kp)
+        # track wrist speed for gate (wrist coords are normalised → small values)
+        if self._prev_kp is not None:
+            lw = float(np.linalg.norm(kp[9,:2]  - self._prev_kp[9,:2]))
+            rw = float(np.linalg.norm(kp[10,:2] - self._prev_kp[10,:2]))
+            self._wrist_spd = max(lw, rw)
+        else:
+            self._wrist_spd = 0.0
+
         self._prev_kp = kp.copy()
 
-        feature = np.concatenate([kp_flat, bbox, motion], dtype=np.float32)
-        assert feature.shape == (FEATURE_DIM,), f"Bad feature dim {feature.shape}"
+        feat = np.concatenate([kp_flat, bbox, motion], dtype=np.float32)
+        self._buf.append(feat.tolist())
 
-        self._buf.append(feature.tolist())
+        if len(self._buf) < self.seq_len:
+            return None
 
-        if len(self._buf) == self.seq_len:
-            seq = np.array(list(self._buf), dtype=np.float32)  # (seq, feat)
-            return seq[np.newaxis]   # (1, seq, feat)
+        # ── MOTION GATE ───────────────────────────────────────────────────
+        # If wrists haven't moved enough → person is still → suppress output
+        if self._wrist_spd < MOTION_GATE:
+            return None
 
-        return None
+        return np.array(list(self._buf), dtype=np.float32)[np.newaxis]
 
 
 def normalise_keypoints(kp_xyc: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
-    """
-    Divide x coords by img_w and y coords by img_h so keypoints are in [0,1].
-    kp_xyc: (17, 3) array with x, y in pixel space.
-    Returns (51,) flattened normalised array.
-    """
     kp = kp_xyc.copy().astype(np.float32)
     kp[:, 0] /= max(img_w, 1)
     kp[:, 1] /= max(img_h, 1)
@@ -148,12 +146,7 @@ def normalise_keypoints(kp_xyc: np.ndarray, img_w: int, img_h: int) -> np.ndarra
 
 
 def normalise_bbox(bbox_xyxy: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
-    """
-    Normalise [x1, y1, x2, y2] to [0,1] range.
-    """
     b = bbox_xyxy.copy().astype(np.float32)
-    b[0] /= max(img_w, 1)
-    b[1] /= max(img_h, 1)
-    b[2] /= max(img_w, 1)
-    b[3] /= max(img_h, 1)
+    b[0] /= max(img_w, 1); b[1] /= max(img_h, 1)
+    b[2] /= max(img_w, 1); b[3] /= max(img_h, 1)
     return b
