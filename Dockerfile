@@ -9,8 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt')"
 
@@ -25,4 +24,4 @@ ENV GRADIO_SERVER_NAME="0.0.0.0"
 
 EXPOSE 10000
 
-CMD ["python", "app.py"]
+CMD ["python", "app.py"]    

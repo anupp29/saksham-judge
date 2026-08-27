@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Boxing Judge</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0a; color: #eee; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 20px; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; letter-spacing: 2px; }
+  .sub { color: #888; font-size: 0.8rem; margin-bottom: 16px; }
+
+  .arena { position: relative; width: 640px; max-width: 100%; }
+  video  { display: none; }
+  canvas { width: 100%; border-radius: 8px; background: #111; display: block; }
+
+  /* label banner */
+  #banner {
+    position: absolute; top: 0; left: 0; right: 0;
+    background: rgba(0,0,0,0.7);
+    padding: 8px 14px;
+    border-radius: 8px 8px 0 0;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  #label { font-size: 1.3rem; font-weight: 700; letter-spacing: 1px; }
+  #fps   { font-size: 0.75rem; color: #aaa; }
+
+  /* confidence bar */
+  #conf-wrap { height: 6px; background: #222; border-radius: 0; overflow: hidden; }
+  #conf-bar  { height: 100%; width: 0%; transition: width 0.1s, background 0.2s; }
+
+  /* prob table */
+  #probs {
+    margin-top: 12px; width: 640px; max-width: 100%;
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .prob-row { background: #161616; border-radius: 6px; padding: 6px 10px; }
+  .prob-name { font-size: 0.72rem; color: #aaa; margin-bottom: 3px; }
+  .prob-bar-wrap { background: #2a2a2a; border-radius: 4px; height: 8px; overflow: hidden; }
+  .prob-bar  { height: 100%; width: 0%; border-radius: 4px; transition: width 0.12s; }
+  .prob-val  { font-size: 0.7rem; color: #ccc; margin-top: 2px; text-align: right; }
+
+  /* controls */
+  #controls { margin-top: 14px; display: flex; gap: 10px; }
+  button {
+    background: #1f1f1f; border: 1px solid #333; color: #ccc;
+    padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 0.85rem;
+  }
+  button:hover { background: #2a2a2a; }
+  #status { color: #666; font-size: 0.75rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h1>🥊 BOXING JUDGE</h1>
+<p class="sub">MediaPipe Pose · BiLSTM · Real-Time</p>
+
+<div class="arena">
+  <video id="vid" playsinline></video>
+  <canvas id="canvas" width="640" height="480"></canvas>
+  <div id="banner">
+    <span id="label">Starting…</span>
+    <span id="fps">-- fps</span>
+  </div>
+  <div id="conf-wrap"><div id="conf-bar"></div></div>
+</div>
+
+<div id="probs"></div>
+
+<div id="controls">
+  <button onclick="resetBuf()">🔄 Reset Buffer</button>
+  <button onclick="toggleCam()">📷 Toggle Cam</button>
+</div>
+<p id="status">Initialising MediaPipe…</p>
+
+<!-- MediaPipe from CDN — zero install -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+<script>
+// ── class colours ──────────────────────────────────────────────────────────
+const COLOURS = {
+  jab_left:        '#ff6464',
+  jab_right:       '#64ff64',
+  hook_left:       '#ffc800',
+  hook_right:      '#00c8ff',
+  uppercut_left:   '#c800ff',
+  uppercut_right:  '#ff9632',
+  body_hook_left:  '#32ffc8',
+  body_hook_right: '#c832ff',
+};
+const CLASSES = Object.keys(COLOURS);
+
+// ── build prob rows ────────────────────────────────────────────────────────
+const probsDiv = document.getElementById('probs');
+CLASSES.forEach(cls => {
+  probsDiv.innerHTML += `
+    <div class="prob-row" id="row-${cls}">
+      <div class="prob-name">${cls.replace(/_/g,' ')}</div>
+      <div class="prob-bar-wrap"><div class="prob-bar" id="bar-${cls}" style="background:${COLOURS[cls]}"></div></div>
+      <div class="prob-val" id="val-${cls}">0%</div>
+    </div>`;
+});
+
+// ── state ──────────────────────────────────────────────────────────────────
+const vid    = document.getElementById('vid');
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+let lastResult = null;
+let frameCount = 0, fpsTime = performance.now(), fps = 0;
+let running = true;
+
+// ── MediaPipe Pose ─────────────────────────────────────────────────────────
+const pose = new Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}` });
+pose.setOptions({
+  modelComplexity: 1,
+  smoothLandmarks: true,
+  enableSegmentation: false,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5,
+});
+
+pose.onResults(onResults);
+
+async function onResults(results) {
+  if (!running) return;
+
+  // draw mirrored video frame
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.drawImage(results.image, -canvas.width, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  if (results.poseLandmarks && results.poseLandmarks.length === 33) {
+    // MediaPipe returns 33 landmarks; YOLO uses 17 (COCO subset)
+    // Map MP indices → COCO-17
+    const MP_TO_COCO = [0,2,5,7,8,11,12,13,14,15,16,23,24,25,26,27,28];
+    // (0=nose,1=leftEye,2=rightEye,3=leftEar,4=rightEar,
+    //  5=lShoulder,6=rShoulder,7=lElbow,8=rElbow,
+    //  9=lWrist,10=rWrist,11=lHip,12=rHip,
+    //  13=lKnee,14=rKnee,15=lAnkle,16=rAnkle)
+
+    const lm = results.poseLandmarks;
+    const W  = canvas.width, H = canvas.height;
+
+    // build 17-point array [[x_px, y_px, conf], ...]
+    const kp17 = MP_TO_COCO.map(i => {
+      const p = lm[i];
+      // mirror x because we drew mirrored
+      return [(1 - p.x) * W, p.y * H, p.visibility ?? 0.9];
+    });
+
+    // bbox from keypoints
+    const xs = kp17.map(p => p[0]), ys = kp17.map(p => p[1]);
+    const bbox = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+
+    // draw skeleton on canvas
+    drawSkeleton(kp17);
+
+    // send to backend
+    sendPredict(kp17, bbox, W, H);
+  }
+
+  // FPS
+  frameCount++;
+  const now = performance.now();
+  if (now - fpsTime >= 1000) {
+    fps = Math.round(frameCount * 1000 / (now - fpsTime));
+    frameCount = 0; fpsTime = now;
+    document.getElementById('fps').textContent = fps + ' fps';
+  }
+
+  // draw last prediction overlay
+  if (lastResult) drawOverlay(lastResult);
+}
+
+// ── skeleton draw ──────────────────────────────────────────────────────────
+const SKEL = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],
+              [5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+
+function drawSkeleton(kp) {
+  ctx.strokeStyle = '#00e676';
+  ctx.lineWidth = 2;
+  SKEL.forEach(([a,b]) => {
+    if (kp[a][2] > 0.3 && kp[b][2] > 0.3) {
+      ctx.beginPath();
+      ctx.moveTo(kp[a][0], kp[a][1]);
+      ctx.lineTo(kp[b][0], kp[b][1]);
+      ctx.stroke();
+    }
+  });
+  kp.forEach(([x,y,c]) => {
+    if (c > 0.3) {
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, 2*Math.PI);
+      ctx.fillStyle = '#ffeb3b';
+      ctx.fill();
+    }
+  });
+}
+
+// ── overlay text ───────────────────────────────────────────────────────────
+function drawOverlay(r) {
+  const colour = COLOURS[r.label] || '#ccc';
+  document.getElementById('label').textContent = r.label.replace(/_/g,' ').toUpperCase();
+  document.getElementById('label').style.color = colour;
+  const bar = document.getElementById('conf-bar');
+  bar.style.width   = (r.confidence * 100).toFixed(1) + '%';
+  bar.style.background = colour;
+
+  CLASSES.forEach(cls => {
+    const p = (r.probabilities?.[cls] || 0) * 100;
+    document.getElementById('bar-' + cls).style.width = p.toFixed(1) + '%';
+    document.getElementById('val-' + cls).textContent  = p.toFixed(1) + '%';
+  });
+}
+
+// ── API call ───────────────────────────────────────────────────────────────
+let inflight = false;
+async function sendPredict(kp17, bbox, w, h) {
+  if (inflight) return;   // drop frame if previous still pending
+  inflight = true;
+  try {
+    const res = await fetch('/predict', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ keypoints: kp17, bbox, img_w: w, img_h: h })
+    });
+    lastResult = await res.json();
+    document.getElementById('status').textContent = '';
+    if (lastResult.label.startsWith('collecting'))
+      document.getElementById('label').textContent = lastResult.label;
+  } catch(e) {
+    document.getElementById('status').textContent = 'Server unreachable — retrying…';
+  } finally {
+    inflight = false;
+  }
+}
+
+// ── camera start ───────────────────────────────────────────────────────────
+async function startCam() {
+  document.getElementById('status').textContent = 'Opening camera…';
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480, facingMode: 'user' }, audio: false
+  });
+  vid.srcObject = stream;
+  await vid.play();
+
+  const camera = new Camera(vid, {
+    onFrame: async () => { await pose.send({ image: vid }); },
+    width: 640, height: 480
+  });
+  camera.start();
+  document.getElementById('status').textContent = 'Live ✓  —  stand 2–3 m from camera';
+}
+
+function toggleCam() { running = !running; }
+
+async function resetBuf() {
+  await fetch('/reset', { method: 'POST' });
+  lastResult = null;
+  document.getElementById('label').textContent = 'Buffer reset';
+  document.getElementById('conf-bar').style.width = '0%';
+}
+
+startCam().catch(e => {
+  document.getElementById('status').textContent = 'Camera error: ' + e.message;
+});
+</script>
+</body>
+</html>

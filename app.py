@@ -1,99 +1,84 @@
 """
-Boxing Judge — Gradio app
-Runs on Render free tier (port from $PORT env var)
-/ping → keep-alive endpoint
+Boxing Judge — FastAPI backend
+No Gradio. No HuggingFace. No dependency hell.
+
+Endpoints:
+  GET  /           → serves index.html (MediaPipe webcam UI)
+  GET  /ping       → keep-alive
+  POST /predict    → {keypoints: [[x,y,conf]×17], bbox: [x1,y1,x2,y2]} → {label, confidence, probabilities}
 """
 
 from __future__ import annotations
 import os, time
-import cv2
-import gradio as gr
-import numpy as np
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from pathlib import Path
 
-from feature_extractor import CLASS_NAMES
+import numpy as np
+import torch
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from feature_extractor import (
+    CLASS_NAMES, SEQUENCE_LENGTH,
+    FeatureBuffer, normalise_keypoints, normalise_bbox
+)
 from inference import BoxingInferenceEngine
 
-SKELETON = [
-    (0,1),(0,2),(1,3),(2,4),
-    (5,6),(5,7),(7,9),(6,8),(8,10),
-    (5,11),(6,12),(11,12),
-    (11,13),(13,15),(12,14),(14,16),
-]
-COLOURS = {
-    "jab_left":       (255,100,100), "jab_right":       (100,255,100),
-    "hook_left":      (255,200,  0), "hook_right":      (  0,200,255),
-    "uppercut_left":  (200,  0,255), "uppercut_right":  (255,150, 50),
-    "body_hook_left": ( 50,255,200), "body_hook_right": (200, 50,255),
-}
-
-def draw_overlay(frame_rgb: np.ndarray, result: dict) -> np.ndarray:
-    img = frame_rgb.copy()
-    h, w = img.shape[:2]
-    label, conf, fps = result["label"], result["confidence"], result["fps"]
-    kp, probs = result.get("keypoints"), result.get("probabilities", {})
-
-    if kp is not None:
-        pts = [(int(kp[i,0]), int(kp[i,1])) if kp[i,2] > 0.3 else None for i in range(17)]
-        for a, b in SKELETON:
-            if pts[a] and pts[b]:
-                cv2.line(img, pts[a], pts[b], (100,220,100), 2)
-        for p in pts:
-            if p: cv2.circle(img, p, 4, (255,255,0), -1)
-
-    colour = COLOURS.get(label, (200,200,200))
-    cv2.rectangle(img, (0,0), (w,60), (0,0,0), -1)
-    cv2.putText(img, label, (10,40), cv2.FONT_HERSHEY_DUPLEX, 1.1, colour, 2, cv2.LINE_AA)
-    cv2.rectangle(img, (10,50), (10+int(conf*(w//2)),58), colour, -1)
-    cv2.putText(img, f"{fps:.1f} fps", (w-120,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180,180,180), 1)
-
-    bh, y0_base = 12, h - len(CLASS_NAMES)*(12+2) - 10
-    for i, cls in enumerate(CLASS_NAMES):
-        p  = probs.get(cls, 0.0)
-        y0 = y0_base + i*(bh+2)
-        cv2.rectangle(img, (0,y0), (int(p*200), y0+bh), COLOURS.get(cls,(200,200,200)), -1)
-        cv2.putText(img, f"{cls} {p:.2f}", (205, y0+bh-2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220,220,220), 1)
-    return img
-
-print("[app] Pre-warming engine…")
+# ── warm up at import time ─────────────────────────────────────────────────
+print("[app] Warming engine…")
 _engine = BoxingInferenceEngine.get()
-print("[app] Engine warm ✓")
+print("[app] Engine ready ✓")
+_START  = time.time()
 
-_START = time.time()
-fastapi_app = FastAPI()
+app = FastAPI()
 
-@fastapi_app.get("/ping")
+# ── request schema ─────────────────────────────────────────────────────────
+class PredictRequest(BaseModel):
+    keypoints: list[list[float]]   # 17 × [x, y, conf]  — pixel coords
+    bbox:      list[float]         # [x1, y1, x2, y2]   — pixel coords
+    img_w:     int
+    img_h:     int
+
+# ── routes ─────────────────────────────────────────────────────────────────
+@app.get("/ping")
 def ping():
-    return JSONResponse({"status": "ok", "uptime_s": round(time.time() - _START, 1)})
+    return {"status": "ok", "uptime_s": round(time.time() - _START, 1)}
 
-def process_frame(frame: np.ndarray) -> np.ndarray:
-    if frame is None:
-        return np.zeros((480,640,3), dtype=np.uint8)
-    return draw_overlay(frame, _engine.predict(frame))
+@app.post("/predict")
+def predict(req: PredictRequest):
+    kp_raw   = np.array(req.keypoints, dtype=np.float32)   # (17, 3)
+    bbox_raw = np.array(req.bbox,      dtype=np.float32)   # (4,)
 
-def reset_buffer():
+    kp_norm   = normalise_keypoints(kp_raw,  req.img_w, req.img_h)
+    bbox_norm = normalise_bbox(bbox_raw, req.img_w, req.img_h)
+
+    seq = _engine.buf.push(kp_norm, bbox_norm)
+
+    if seq is None:
+        needed = SEQUENCE_LENGTH - len(_engine.buf._buf)
+        return {"label": f"collecting ({needed} more)", "confidence": 0.0,
+                "probabilities": {c: 0.0 for c in CLASS_NAMES}}
+
+    x = torch.tensor(seq, dtype=torch.float32)
+    with torch.no_grad():
+        logits, _ = _engine.lstm(x)
+    probs = torch.softmax(logits[0], dim=0).cpu().numpy()
+    best  = int(np.argmax(probs))
+
+    return {
+        "label":         CLASS_NAMES[best],
+        "confidence":    float(probs[best]),
+        "probabilities": {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+    }
+
+@app.post("/reset")
+def reset():
     _engine.reset()
-    return "Buffer reset ✓"
+    return {"status": "reset"}
 
-with gr.Blocks(title="Boxing Judge", theme=gr.themes.Monochrome()) as demo:
-    gr.Markdown("# 🥊 Boxing Judge — Real-Time Punch Classifier")
-    gr.Markdown("> Stand **2–3 m** from camera · upper body visible · allow webcam")
-    with gr.Row():
-        with gr.Column(scale=3):
-            cam = gr.Image(sources=["webcam"], streaming=True,
-                           type="numpy", mirror_webcam=False, label="Webcam")
-            out = gr.Image(type="numpy", label="Overlay")
-        with gr.Column(scale=1):
-            gr.Markdown("### Classes\n" + "\n".join(f"• `{c}`" for c in CLASS_NAMES))
-            gr.Markdown("---")
-            btn    = gr.Button("🔄 Reset buffer", variant="secondary")
-            status = gr.Textbox(label="Status", interactive=False)
-    cam.stream(fn=process_frame, inputs=cam, outputs=out, time_limit=60)
-    btn.click(fn=reset_buffer, outputs=status)
-
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+# serve static files
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
