@@ -34,8 +34,8 @@ The browser client uses the live webcam endpoint. For machine clients, the outer
 
 ## Deploy to Render
 
-1. Push this repository, including `best_boxing_model.pth`, to the Git provider connected to Render.
-2. Create a Blueprint using `render.yaml`, or create a Python web service with the same build/start commands.
+1. Push this repository, including `best_boxing_model.pth` and `yolov8n-pose.pt`, to the Git provider connected to Render.
+2. Create a Blueprint using `render.yaml`, or create a Docker web service pointing at `Dockerfile`.
 3. Set `CORS_ORIGINS` only if a separate frontend needs cross-origin access; leave it unset for the bundled same-origin client.
 4. Verify `/health/ready`, `/v1/metadata`, and a known 16-frame request after deploy.
 
