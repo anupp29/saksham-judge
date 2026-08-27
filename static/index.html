@@ -6,59 +6,69 @@
 <title>Boxing Judge</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0a0a0a; color: #eee; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 20px; }
-  h1 { font-size: 1.6rem; margin-bottom: 4px; letter-spacing: 2px; }
+  body {
+    background: #0a0a0a; color: #eee;
+    font-family: 'Segoe UI', sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 20px;
+  }
+  h1  { font-size: 1.6rem; margin-bottom: 4px; letter-spacing: 2px; }
   .sub { color: #888; font-size: 0.8rem; margin-bottom: 16px; }
 
+  /* arena — stacks video + overlay canvas */
   .arena { position: relative; width: 640px; max-width: 100%; }
-  video  { display: none; }
-  canvas { width: 100%; border-radius: 8px; background: #111; display: block; }
+  #vid   { width: 100%; border-radius: 8px; display: block; background: #111; transform: scaleX(-1); }
+  #overlay {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
 
   /* label banner */
   #banner {
     position: absolute; top: 0; left: 0; right: 0;
-    background: rgba(0,0,0,0.7);
-    padding: 8px 14px;
-    border-radius: 8px 8px 0 0;
+    background: rgba(0,0,0,0.72);
+    padding: 8px 14px; border-radius: 8px 8px 0 0;
     display: flex; justify-content: space-between; align-items: center;
   }
   #label { font-size: 1.3rem; font-weight: 700; letter-spacing: 1px; }
   #fps   { font-size: 0.75rem; color: #aaa; }
 
   /* confidence bar */
-  #conf-wrap { height: 6px; background: #222; border-radius: 0; overflow: hidden; }
+  #conf-wrap { height: 6px; background: #222; overflow: hidden; }
   #conf-bar  { height: 100%; width: 0%; transition: width 0.1s, background 0.2s; }
 
   /* prob table */
   #probs {
     margin-top: 12px; width: 640px; max-width: 100%;
-    display: grid; grid-template-columns: 1fr 1fr;
-    gap: 6px;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
   }
-  .prob-row { background: #161616; border-radius: 6px; padding: 6px 10px; }
+  .prob-row  { background: #161616; border-radius: 6px; padding: 6px 10px; }
   .prob-name { font-size: 0.72rem; color: #aaa; margin-bottom: 3px; }
   .prob-bar-wrap { background: #2a2a2a; border-radius: 4px; height: 8px; overflow: hidden; }
   .prob-bar  { height: 100%; width: 0%; border-radius: 4px; transition: width 0.12s; }
   .prob-val  { font-size: 0.7rem; color: #ccc; margin-top: 2px; text-align: right; }
 
   /* controls */
-  #controls { margin-top: 14px; display: flex; gap: 10px; }
+  #controls { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
   button {
     background: #1f1f1f; border: 1px solid #333; color: #ccc;
     padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 0.85rem;
   }
   button:hover { background: #2a2a2a; }
-  #status { color: #666; font-size: 0.75rem; margin-top: 8px; }
+  #status { color: #666; font-size: 0.75rem; margin-top: 8px; text-align: center; }
 </style>
 </head>
 <body>
 
 <h1>🥊 BOXING JUDGE</h1>
-<p class="sub">MediaPipe Pose · BiLSTM · Real-Time</p>
+<p class="sub">YOLO Pose · BiLSTM · Server-Side Inference</p>
 
 <div class="arena">
-  <video id="vid" playsinline></video>
-  <canvas id="canvas" width="640" height="480"></canvas>
+  <!-- live webcam feed (CSS-mirrored for natural selfie view) -->
+  <video id="vid" autoplay playsinline muted></video>
+  <!-- skeleton drawn here by JS using keypoints returned from server -->
+  <canvas id="overlay"></canvas>
   <div id="banner">
     <span id="label">Starting…</span>
     <span id="fps">-- fps</span>
@@ -70,14 +80,12 @@
 
 <div id="controls">
   <button onclick="resetBuf()">🔄 Reset Buffer</button>
-  <button onclick="toggleCam()">📷 Toggle Cam</button>
+  <button onclick="toggleCam()">📷 Pause / Resume</button>
 </div>
-<p id="status">Initialising MediaPipe…</p>
+<p id="status">Opening camera…</p>
 
-<!-- MediaPipe from CDN — zero install -->
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+<!-- hidden canvas used ONLY for frame capture — not shown to user -->
+<canvas id="cap" style="display:none"></canvas>
 
 <script>
 // ── class colours ──────────────────────────────────────────────────────────
@@ -104,167 +112,171 @@ CLASSES.forEach(cls => {
     </div>`;
 });
 
+// ── DOM refs ───────────────────────────────────────────────────────────────
+const vid      = document.getElementById('vid');
+const overlay  = document.getElementById('overlay');
+const oc       = overlay.getContext('2d');
+const cap      = document.getElementById('cap');
+const capCtx   = cap.getContext('2d');
+
 // ── state ──────────────────────────────────────────────────────────────────
-const vid    = document.getElementById('vid');
-const canvas = document.getElementById('canvas');
-const ctx    = canvas.getContext('2d');
+let running    = true;
+let inflight   = false;
 let lastResult = null;
-let frameCount = 0, fpsTime = performance.now(), fps = 0;
-let running = true;
+let frameCount = 0, fpsTime = performance.now();
+let animId     = null;
 
-// ── MediaPipe Pose ─────────────────────────────────────────────────────────
-const pose = new Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}` });
-pose.setOptions({
-  modelComplexity: 1,
-  smoothLandmarks: true,
-  enableSegmentation: false,
-  minDetectionConfidence: 0.5,
-  minTrackingConfidence: 0.5,
-});
+// ── COCO-17 skeleton connections ───────────────────────────────────────────
+const SKEL = [
+  [0,1],[0,2],[1,3],[2,4],          // head
+  [5,6],[5,7],[7,9],[6,8],[8,10],   // arms
+  [5,11],[6,12],[11,12],            // torso
+  [11,13],[13,15],[12,14],[14,16],  // legs
+];
 
-pose.onResults(onResults);
-
-async function onResults(results) {
-  if (!running) return;
-
-  // draw mirrored video frame
-  ctx.save();
-  ctx.scale(-1, 1);
-  ctx.drawImage(results.image, -canvas.width, 0, canvas.width, canvas.height);
-  ctx.restore();
-
-  if (results.poseLandmarks && results.poseLandmarks.length === 33) {
-    // MediaPipe returns 33 landmarks; YOLO uses 17 (COCO subset)
-    // Map MP indices → COCO-17
-    const MP_TO_COCO = [0,2,5,7,8,11,12,13,14,15,16,23,24,25,26,27,28];
-    // (0=nose,1=leftEye,2=rightEye,3=leftEar,4=rightEar,
-    //  5=lShoulder,6=rShoulder,7=lElbow,8=rElbow,
-    //  9=lWrist,10=rWrist,11=lHip,12=rHip,
-    //  13=lKnee,14=rKnee,15=lAnkle,16=rAnkle)
-
-    const lm = results.poseLandmarks;
-    const W  = canvas.width, H = canvas.height;
-
-    // build 17-point array [[x_px, y_px, conf], ...]
-    const kp17 = MP_TO_COCO.map(i => {
-      const p = lm[i];
-      // mirror x because we drew mirrored
-      return [(1 - p.x) * W, p.y * H, p.visibility ?? 0.9];
-    });
-
-    // bbox from keypoints
-    const xs = kp17.map(p => p[0]), ys = kp17.map(p => p[1]);
-    const bbox = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
-
-    // draw skeleton on canvas
-    drawSkeleton(kp17);
-
-    // send to backend
-    sendPredict(kp17, bbox, W, H);
-  }
-
-  // FPS
-  frameCount++;
-  const now = performance.now();
-  if (now - fpsTime >= 1000) {
-    fps = Math.round(frameCount * 1000 / (now - fpsTime));
-    frameCount = 0; fpsTime = now;
-    document.getElementById('fps').textContent = fps + ' fps';
-  }
-
-  // draw last prediction overlay
-  if (lastResult) drawOverlay(lastResult);
-}
-
-// ── skeleton draw ──────────────────────────────────────────────────────────
-const SKEL = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],
-              [5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
-
+// ── draw skeleton on overlay canvas ───────────────────────────────────────
 function drawSkeleton(kp) {
-  ctx.strokeStyle = '#00e676';
-  ctx.lineWidth = 2;
-  SKEL.forEach(([a,b]) => {
-    if (kp[a][2] > 0.3 && kp[b][2] > 0.3) {
-      ctx.beginPath();
-      ctx.moveTo(kp[a][0], kp[a][1]);
-      ctx.lineTo(kp[b][0], kp[b][1]);
-      ctx.stroke();
+  // kp: [[x_px, y_px, conf], ...]  17 points, in RAW (non-mirrored) pixel coords
+  // The video is CSS-mirrored (transform:scaleX(-1)), so we mirror x here too.
+  const W = overlay.width;
+  const mirror = ([x, y, c]) => [W - x, y, c];
+
+  oc.clearRect(0, 0, overlay.width, overlay.height);
+
+  // bones
+  oc.strokeStyle = '#00e676';
+  oc.lineWidth   = 2.5;
+  SKEL.forEach(([a, b]) => {
+    const [ax, ay, ac] = mirror(kp[a]);
+    const [bx, by, bc] = mirror(kp[b]);
+    if (ac > 0.3 && bc > 0.3) {
+      oc.beginPath();
+      oc.moveTo(ax, ay);
+      oc.lineTo(bx, by);
+      oc.stroke();
     }
   });
-  kp.forEach(([x,y,c]) => {
+
+  // joints
+  kp.forEach(pt => {
+    const [x, y, c] = mirror(pt);
     if (c > 0.3) {
-      ctx.beginPath();
-      ctx.arc(x, y, 4, 0, 2*Math.PI);
-      ctx.fillStyle = '#ffeb3b';
-      ctx.fill();
+      oc.beginPath();
+      oc.arc(x, y, 4, 0, 2 * Math.PI);
+      oc.fillStyle = '#ffeb3b';
+      oc.fill();
     }
   });
 }
 
-// ── overlay text ───────────────────────────────────────────────────────────
+// ── update label / bars ────────────────────────────────────────────────────
 function drawOverlay(r) {
   const lbl = r.label || '';
-  const isIdle = lbl.toLowerCase() === 'idle' || lbl.startsWith('collecting') || lbl.startsWith('Collecting');
-  const colour = isIdle ? '#666' : (COLOURS[r.label] || '#ccc');
-  const displayText = isIdle ? (lbl.startsWith('collect') || lbl.startsWith('Collect') ? lbl : 'IDLE — no punch detected') : lbl.replace(/_/g,' ').toUpperCase();
-  document.getElementById('label').textContent = displayText;
-  document.getElementById('label').style.color = colour;
+  const isIdle = lbl === 'idle' || lbl === 'Idle'
+               || lbl.startsWith('Collecting') || lbl.startsWith('collecting')
+               || lbl === 'No person detected';
+  const colour      = isIdle ? '#555' : (COLOURS[lbl] || '#ccc');
+  const displayText = isIdle
+    ? (lbl.startsWith('collect') || lbl.startsWith('Collect') ? lbl.toUpperCase() : 'IDLE')
+    : lbl.replace(/_/g, ' ').toUpperCase();
+
+  document.getElementById('label').textContent  = displayText;
+  document.getElementById('label').style.color  = colour;
   const bar = document.getElementById('conf-bar');
-  bar.style.width   = isIdle ? '0%' : (r.confidence * 100).toFixed(1) + '%';
+  bar.style.width      = isIdle ? '0%' : (r.confidence * 100).toFixed(1) + '%';
   bar.style.background = colour;
 
   CLASSES.forEach(cls => {
     const p = (r.probabilities?.[cls] || 0) * 100;
     document.getElementById('bar-' + cls).style.width = p.toFixed(1) + '%';
-    document.getElementById('val-' + cls).textContent  = p.toFixed(1) + '%';
+    document.getElementById('val-' + cls).textContent = p.toFixed(1) + '%';
+  });
+
+  if (r.keypoints) drawSkeleton(r.keypoints);
+  else oc.clearRect(0, 0, overlay.width, overlay.height);
+}
+
+// ── capture one frame → JPEG blob ─────────────────────────────────────────
+function captureBlob(quality = 0.7) {
+  return new Promise(resolve => {
+    cap.width  = vid.videoWidth  || 640;
+    cap.height = vid.videoHeight || 480;
+    capCtx.drawImage(vid, 0, 0, cap.width, cap.height);
+    cap.toBlob(resolve, 'image/jpeg', quality);
   });
 }
 
-// ── API call ───────────────────────────────────────────────────────────────
-let inflight = false;
-async function sendPredict(kp17, bbox, w, h) {
-  if (inflight) return;   // drop frame if previous still pending
+// ── POST frame to /predict ─────────────────────────────────────────────────
+async function sendFrame() {
+  if (inflight || !running) return;
+  if (!vid.videoWidth) return;          // camera not ready yet
+
   inflight = true;
   try {
-    const res = await fetch('/predict', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ keypoints: kp17, bbox, img_w: w, img_h: h })
-    });
+    const blob = await captureBlob(0.75);   // ~25 KB per frame at 640×480
+    const fd   = new FormData();
+    fd.append('frame', blob, 'frame.jpg');
+
+    const res = await fetch('/predict', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     lastResult = await res.json();
     document.getElementById('status').textContent = '';
-    // drawOverlay handles all label states including idle/collecting
-  } catch(e) {
-    document.getElementById('status').textContent = 'Server unreachable — retrying…';
+
+    // sync overlay canvas size to video element's rendered size
+    overlay.width  = vid.videoWidth;
+    overlay.height = vid.videoHeight;
+
+    drawOverlay(lastResult);
+
+    // FPS from server (includes YOLO + LSTM time)
+    if (lastResult.fps)
+      document.getElementById('fps').textContent = lastResult.fps.toFixed(0) + ' fps';
+  } catch (e) {
+    document.getElementById('status').textContent = 'Server error: ' + e.message;
   } finally {
     inflight = false;
   }
+}
+
+// ── inference loop — fires as fast as server can keep up ──────────────────
+function loop() {
+  sendFrame();
+  animId = requestAnimationFrame(loop);
 }
 
 // ── camera start ───────────────────────────────────────────────────────────
 async function startCam() {
   document.getElementById('status').textContent = 'Opening camera…';
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: 640, height: 480, facingMode: 'user' }, audio: false
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+    audio: false,
   });
   vid.srcObject = stream;
   await vid.play();
 
-  const camera = new Camera(vid, {
-    onFrame: async () => { await pose.send({ image: vid }); },
-    width: 640, height: 480
-  });
-  camera.start();
+  // sync overlay dimensions once video metadata is known
+  overlay.width  = vid.videoWidth  || 640;
+  overlay.height = vid.videoHeight || 480;
+
   document.getElementById('status').textContent = 'Live ✓  —  stand 2–3 m from camera';
+  loop();
 }
 
-function toggleCam() { running = !running; }
+function toggleCam() {
+  running = !running;
+  document.getElementById('status').textContent = running ? 'Resumed' : 'Paused';
+}
 
 async function resetBuf() {
   await fetch('/reset', { method: 'POST' });
   lastResult = null;
+  oc.clearRect(0, 0, overlay.width, overlay.height);
   document.getElementById('label').textContent = 'Buffer reset';
   document.getElementById('conf-bar').style.width = '0%';
+  CLASSES.forEach(cls => {
+    document.getElementById('bar-' + cls).style.width = '0%';
+    document.getElementById('val-' + cls).textContent = '0%';
+  });
 }
 
 startCam().catch(e => {
