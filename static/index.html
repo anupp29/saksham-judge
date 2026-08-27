@@ -26,26 +26,34 @@
       <h2>Live webcam</h2>
       <video id="video" autoplay muted playsinline></video><canvas id="canvas"></canvas>
       <div class="actions"><button id="start">Start webcam</button><button class="secondary" id="stop" disabled>Stop</button><button class="secondary" id="reset" disabled>Reset buffer</button></div>
-      <div id="status">Camera is off.</div>
+      <div id="status">Checking service readiness…</div><div id="countdown">Backend warm-up countdown: 120s</div>
       <p class="note">Use a well-lit view with the full upper body visible. The first 16 accepted detections fill the temporal buffer; predictions then update continuously.</p>
     </section>
     <section class="panel"><h2>Latest response</h2><pre id="response">Start the webcam to begin.</pre></section>
   </div>
 </main>
 <script>
-  const video=document.querySelector('#video'), canvas=document.querySelector('#canvas'), responseBox=document.querySelector('#response'), statusBox=document.querySelector('#status');
+  const video=document.querySelector('#video'), canvas=document.querySelector('#canvas'), responseBox=document.querySelector('#response'), statusBox=document.querySelector('#status'), countdownBox=document.querySelector('#countdown');
   const startButton=document.querySelector('#start'), stopButton=document.querySelector('#stop'), resetButton=document.querySelector('#reset');
-  let stream=null, running=false, busy=false, timer=null; const sessionId=crypto.randomUUID();
+  let stream=null, running=false, busy=false, timer=null, serviceReady=false; const sessionId=crypto.randomUUID(); startButton.disabled=true;
   function status(message,ok=false){statusBox.textContent=message;statusBox.className=ok?'status-ok':'';}
+  async function pollService(){
+    try { const r=await fetch('/health/status',{cache:'no-store'}); const data=await r.json(); serviceReady=data.status==='ready'; startButton.disabled=!serviceReady;
+      if(serviceReady){ status('Service ready; camera is off.',true); countdownBox.textContent=`Backend warm-up complete in ${data.elapsed_s}s.`; }
+      else if(data.status==='failed'){ status(data.message); countdownBox.textContent='Backend failed to start; inspect Render logs.'; }
+      else { status(data.message); countdownBox.textContent=`Backend warm-up countdown: ${data.startup_timeout_remaining_s}s remaining.`; }
+    } catch(error){ serviceReady=false; startButton.disabled=true; status('Waiting for backend…'); countdownBox.textContent='Backend warm-up countdown: connecting…'; }
+  }
+  pollService(); setInterval(pollService,1000);
   async function sendFrame(){
     if(!running||busy||video.readyState<2)return; busy=true;
     canvas.width=video.videoWidth||640; canvas.height=video.videoHeight||480; const ctx=canvas.getContext('2d'); ctx.drawImage(video,0,0,canvas.width,canvas.height);
-    try { const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.78)); const r=await fetch('/v1/predict/frame?top_k=3',{method:'POST',headers:{'X-Session-ID':sessionId},body:blob}); const data=await r.json(); responseBox.textContent=JSON.stringify(data,null,2); if(data.status==='prediction')status(`${data.prediction.label} — ${(data.prediction.confidence*100).toFixed(1)}%`,true); else if(data.status==='buffering')status(`Collecting frames: ${data.buffered_frames}/${data.required_frames}`); else status('No person detected; buffer reset.'); }
+    try { const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.78)); const r=await fetch('/v1/predict/frame?top_k=3',{method:'POST',headers:{'X-Session-ID':sessionId},body:blob}); const data=await r.json(); responseBox.textContent=JSON.stringify(data,null,2); if(data.status==='prediction'){status(`${data.prediction.label} — ${(data.prediction.confidence*100).toFixed(1)}%`,true);countdownBox.textContent='Prediction ready; continuing live updates.';} else if(data.status==='buffering'){const remaining=data.required_frames-data.buffered_frames;status(`Collecting frames: ${data.buffered_frames}/${data.required_frames}`);countdownBox.textContent=`Prediction countdown: ${remaining} frame${remaining===1?'':'s'} remaining.`;} else {status('No person detected; buffer reset.');countdownBox.textContent='Prediction countdown reset: 16 frames required.';} }
     catch(error){ responseBox.textContent=String(error); status('Inference request failed.'); } finally { busy=false; if(running)timer=setTimeout(sendFrame,100); }
   }
-  startButton.onclick=async()=>{ try { stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false}); video.srcObject=stream; running=true; startButton.disabled=true; stopButton.disabled=false; resetButton.disabled=false; status('Camera started; warming detector…'); sendFrame(); } catch(error){status(`Camera permission failed: ${error.message}`);} };
-  stopButton.onclick=()=>{running=false;clearTimeout(timer);if(stream)stream.getTracks().forEach(track=>track.stop());video.srcObject=null;stream=null;startButton.disabled=false;stopButton.disabled=true;resetButton.disabled=true;status('Camera is off.');};
-  resetButton.onclick=async()=>{await fetch('/v1/reset',{method:'POST',headers:{'X-Session-ID':sessionId}});status('Buffer reset.');};
+  startButton.onclick=async()=>{ if(!serviceReady)return; try { stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false}); video.srcObject=stream; running=true; startButton.disabled=true; stopButton.disabled=false; resetButton.disabled=false; status('Camera started; sending frames…'); sendFrame(); } catch(error){status(`Camera permission failed: ${error.message}`);} };
+  stopButton.onclick=()=>{running=false;clearTimeout(timer);if(stream)stream.getTracks().forEach(track=>track.stop());video.srcObject=null;stream=null;startButton.disabled=!serviceReady;stopButton.disabled=true;resetButton.disabled=true;status('Camera is off.');};
+  resetButton.onclick=async()=>{await fetch('/v1/reset',{method:'POST',headers:{'X-Session-ID':sessionId}});countdownBox.textContent='Prediction countdown reset: 16 frames required.';status('Buffer reset.');};
 </script>
 </body>
 </html>

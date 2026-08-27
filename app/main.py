@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from app.model import CLASS_NAMES, FEATURE_DIM, SEQUENCE_LENGTH, ModelBundle, lo
 from app.detector import PoseDetector
 from app.preprocessing import InputContractError, build_feature_matrix, build_from_features
 from app.sessions import SessionManager
+from app.startup import StartupStatus
 from app.schemas import PredictRequest, Prediction, PredictionResponse
 
 
@@ -31,25 +33,59 @@ POSE_CONFIDENCE = float(os.getenv("POSE_CONFIDENCE", "0.35"))
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "5000000"))
 
 
+async def initialize_models(app: FastAPI) -> None:
+    """Load both models in a worker thread while exposing progress to health/UI."""
+    startup: StartupStatus = app.state.startup
+    started = time.perf_counter()
+    try:
+        startup.update("loading_classifier", "Loading boxing classifier checkpoint")
+        logger.info("STARTUP phase=loading_classifier path=%s", MODEL_PATH)
+        bundle = await asyncio.to_thread(load_model_bundle, MODEL_PATH)
+        logger.info(
+            "STARTUP phase=classifier_ready device=%s warmup_ms=%.2f sha256=%s elapsed_ms=%.2f",
+            bundle.device,
+            bundle.warmup_ms,
+            bundle.checkpoint_sha256,
+            (time.perf_counter() - started) * 1000.0,
+        )
+
+        startup.update("loading_pose_detector", f"Loading pose detector {POSE_MODEL_PATH}")
+        logger.info("STARTUP phase=loading_pose_detector path=%s", POSE_MODEL_PATH)
+        detector_started = time.perf_counter()
+        detector = await asyncio.to_thread(PoseDetector, POSE_MODEL_PATH, POSE_CONFIDENCE)
+        logger.info(
+            "STARTUP phase=pose_detector_ready detector_init_ms=%.2f elapsed_ms=%.2f",
+            (time.perf_counter() - detector_started) * 1000.0,
+            (time.perf_counter() - started) * 1000.0,
+        )
+
+        app.state.bundle = bundle
+        app.state.detector = detector
+        app.state.sessions = SessionManager(
+            ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "900")),
+            max_sessions=int(os.getenv("MAX_SESSIONS", "1000")),
+        )
+        startup.update("ready", "Classifier and pose detector are warm and ready")
+        logger.info(
+            "STARTUP phase=ready total_startup_ms=%.2f model_warmup_ms=%.2f",
+            (time.perf_counter() - started) * 1000.0,
+            bundle.warmup_ms,
+        )
+    except Exception as exc:
+        startup.fail(f"Startup failed: {exc}")
+        logger.exception("STARTUP phase=failed elapsed_ms=%.2f", (time.perf_counter() - started) * 1000.0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    started = time.perf_counter()
-    logger.info("Loading model checkpoint from %s", MODEL_PATH)
-    app.state.bundle = load_model_bundle(MODEL_PATH)
-    logger.info("Loading pose detector from %s", POSE_MODEL_PATH)
-    app.state.detector = PoseDetector(POSE_MODEL_PATH, confidence=POSE_CONFIDENCE)
-    app.state.sessions = SessionManager(
-        ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "900")),
-        max_sessions=int(os.getenv("MAX_SESSIONS", "1000")),
-    )
-    logger.info(
-        "Model ready: device=%s warmup_ms=%.2f startup_ms=%.2f sha256=%s",
-        app.state.bundle.device,
-        app.state.bundle.warmup_ms,
-        (time.perf_counter() - started) * 1000.0,
-        app.state.bundle.checkpoint_sha256,
-    )
+    app.state.startup = StartupStatus()
+    app.state.bundle = None
+    app.state.detector = None
+    app.state.sessions = None
+    app.state.initializer = asyncio.create_task(initialize_models(app))
     yield
+    app.state.initializer.cancel()
+    await asyncio.gather(app.state.initializer, return_exceptions=True)
     app.state.bundle = None
     app.state.detector = None
     app.state.sessions = None
@@ -89,6 +125,15 @@ def ready(request: Request) -> dict[str, str]:
     if bundle is None:
         raise HTTPException(status_code=503, detail="model is not loaded")
     return {"status": "ready"}
+
+
+@app.get("/health/status", tags=["health"])
+def status(request: Request) -> dict[str, object]:
+    startup: StartupStatus = request.app.state.startup
+    result = startup.snapshot()
+    result["classifier_loaded"] = getattr(request.app.state, "bundle", None) is not None
+    result["pose_detector_loaded"] = getattr(request.app.state, "detector", None) is not None
+    return result
 
 
 @app.get("/v1/metadata", tags=["model"])
@@ -179,6 +224,7 @@ async def predict_frame(
     if detection.detection is None:
         # Do not blend frames from two separate people or from a long occlusion.
         session.reset()
+        logger.debug("FRAME session=%s status=no_detection detect_ms=%.2f", session_id, detection.detect_ms)
         return {
             "status": "no_detection",
             "session_id": session_id,
@@ -190,6 +236,13 @@ async def predict_frame(
 
     sequence = session.push(detection.detection)
     if sequence is None:
+        logger.debug(
+            "FRAME session=%s status=buffering buffered=%d/%d detect_ms=%.2f",
+            session_id,
+            len(session.features),
+            SEQUENCE_LENGTH,
+            detection.detect_ms,
+        )
         return {
             "status": "buffering",
             "session_id": session_id,
@@ -208,6 +261,14 @@ async def predict_frame(
         "bbox": detection.bbox.tolist() if detection.bbox is not None else None,
         "keypoints": detection.keypoints.tolist() if detection.keypoints is not None else None,
     })
+    logger.info(
+        "INFERENCE session=%s label=%s confidence=%.4f detect_ms=%.2f inference_ms=%.2f",
+        session_id,
+        result["prediction"]["label"],
+        result["prediction"]["confidence"],
+        detection.detect_ms,
+        result["inference_ms"],
+    )
     return result
 
 
