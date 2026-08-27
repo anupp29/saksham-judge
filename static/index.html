@@ -203,11 +203,14 @@ function drawSkeleton(kp) {
 
 // ── overlay text ───────────────────────────────────────────────────────────
 function drawOverlay(r) {
-  const colour = COLOURS[r.label] || '#ccc';
-  document.getElementById('label').textContent = r.label.replace(/_/g,' ').toUpperCase();
+  const lbl = r.label || '';
+  const isIdle = lbl.toLowerCase() === 'idle' || lbl.startsWith('collecting') || lbl.startsWith('Collecting');
+  const colour = isIdle ? '#666' : (COLOURS[r.label] || '#ccc');
+  const displayText = isIdle ? (lbl.startsWith('collect') || lbl.startsWith('Collect') ? lbl : 'IDLE — no punch detected') : lbl.replace(/_/g,' ').toUpperCase();
+  document.getElementById('label').textContent = displayText;
   document.getElementById('label').style.color = colour;
   const bar = document.getElementById('conf-bar');
-  bar.style.width   = (r.confidence * 100).toFixed(1) + '%';
+  bar.style.width   = isIdle ? '0%' : (r.confidence * 100).toFixed(1) + '%';
   bar.style.background = colour;
 
   CLASSES.forEach(cls => {
@@ -230,8 +233,7 @@ async function sendPredict(kp17, bbox, w, h) {
     });
     lastResult = await res.json();
     document.getElementById('status').textContent = '';
-    if (lastResult.label.startsWith('collecting'))
-      document.getElementById('label').textContent = lastResult.label;
+    // drawOverlay handles all label states including idle/collecting
   } catch(e) {
     document.getElementById('status').textContent = 'Server unreachable — retrying…';
   } finally {

@@ -5,7 +5,14 @@ No Gradio. No HuggingFace. No dependency hell.
 Endpoints:
   GET  /           → serves index.html (MediaPipe webcam UI)
   GET  /ping       → keep-alive
-  POST /predict    → {keypoints: [[x,y,conf]×17], bbox: [x1,y1,x2,y2]} → {label, confidence, probabilities}
+  POST /predict    → {keypoints: [[x,y,conf]×17], bbox: [x1,y1,x2,y2], img_w, img_h}
+                     → {label, confidence, probabilities}
+
+FIXES (2026-08-27):
+  - /predict no longer pre-normalises kp/bbox before passing to buf.push().
+    FeatureBuffer.push() now expects RAW PIXEL coords and handles normalisation
+    plus pixel-scale motion metric computation internally.
+  - Added "Idle" label pass-through to frontend.
 """
 
 from __future__ import annotations
@@ -20,8 +27,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from feature_extractor import (
-    CLASS_NAMES, SEQUENCE_LENGTH,
-    FeatureBuffer, normalise_keypoints, normalise_bbox
+    CLASS_NAMES, SEQUENCE_LENGTH, CONFIDENCE_THRESHOLD,
+    FeatureBuffer,
 )
 from inference import BoxingInferenceEngine
 
@@ -35,8 +42,8 @@ app = FastAPI()
 
 # ── request schema ─────────────────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    keypoints: list[list[float]]   # 17 × [x, y, conf]  — pixel coords
-    bbox:      list[float]         # [x1, y1, x2, y2]   — pixel coords
+    keypoints: list[list[float]]   # 17 × [x_px, y_px, conf]  — PIXEL coords
+    bbox:      list[float]         # [x1_px, y1_px, x2_px, y2_px] — PIXEL coords
     img_w:     int
     img_h:     int
 
@@ -47,29 +54,37 @@ def ping():
 
 @app.post("/predict")
 def predict(req: PredictRequest):
-    kp_raw   = np.array(req.keypoints, dtype=np.float32)   # (17, 3)
-    bbox_raw = np.array(req.bbox,      dtype=np.float32)   # (4,)
+    kp_raw_px   = np.array(req.keypoints, dtype=np.float32)   # (17, 3) PIXEL
+    bbox_raw_px = np.array(req.bbox,      dtype=np.float32)   # (4,)  PIXEL
 
-    kp_norm   = normalise_keypoints(kp_raw,  req.img_w, req.img_h)
-    bbox_norm = normalise_bbox(bbox_raw, req.img_w, req.img_h)
-
-    seq = _engine.buf.push(kp_norm, bbox_norm)
+    # Pass RAW PIXEL arrays — FeatureBuffer handles normalisation internally
+    # so motion metrics are computed in pixel space (matching training scale).
+    seq = _engine.buf.push(kp_raw_px, bbox_raw_px, req.img_w, req.img_h)
 
     if seq is None:
         needed = SEQUENCE_LENGTH - len(_engine.buf._buf)
-        return {"label": f"collecting ({needed} more)", "confidence": 0.0,
+        label  = f"collecting ({needed} more)" if needed > 0 else "idle"
+        return {"label": label, "confidence": 0.0,
                 "probabilities": {c: 0.0 for c in CLASS_NAMES}}
 
     x = torch.tensor(seq, dtype=torch.float32)
     with torch.no_grad():
         logits, _ = _engine.lstm(x)
-    probs = torch.softmax(logits[0], dim=0).cpu().numpy()
-    best  = int(np.argmax(probs))
+    probs    = torch.softmax(logits[0], dim=0).cpu().numpy()
+    raw_best = int(np.argmax(probs))
+
+    # Confidence gate — suppress random-class predictions when uncertain
+    if float(probs[raw_best]) < CONFIDENCE_THRESHOLD:
+        return {"label": "idle", "confidence": float(probs[raw_best]),
+                "probabilities": {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}}
+
+    # Temporal vote smoothing
+    smoothed = _engine.buf.apply_vote(raw_best)
 
     return {
-        "label":         CLASS_NAMES[best],
-        "confidence":    float(probs[best]),
-        "probabilities": {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+        "label":         CLASS_NAMES[smoothed],
+        "confidence":    float(probs[smoothed]),
+        "probabilities": {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))},
     }
 
 @app.post("/reset")

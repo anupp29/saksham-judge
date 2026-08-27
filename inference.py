@@ -5,6 +5,13 @@ Boot order:
   1. Load YOLO (weights baked into Docker image at build time)
   2. Load BoxingLSTM from TorchScript cache (boxing_traced.pt)
      Falls back to loading from .pth if cache not found.
+
+FIXES (2026-08-27):
+  - predict() now passes raw PIXEL kp+bbox to FeatureBuffer.push()
+    (previously passed pre-normalised arrays → motion metric skew)
+  - Applies confidence gate: predictions below CONFIDENCE_THRESHOLD
+    return "idle" instead of a random class
+  - Applies temporal vote smoothing via FeatureBuffer.apply_vote()
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from ultralytics import YOLO
 
 from feature_extractor import (
     CLASS_NAMES,
+    CONFIDENCE_THRESHOLD,
     FEATURE_DIM,
     SEQUENCE_LENGTH,
     FeatureBuffer,
@@ -89,16 +97,16 @@ class BoxingInferenceEngine:
                 half=(DEVICE.type == "cuda"),
             )
 
-        kp_raw = bbox_raw = None
+        kp_raw_px = bbox_raw_px = None
 
         if results and results[0].keypoints is not None:
             kps_all   = results[0].keypoints.data   # (N, 17, 3)
             boxes_all = results[0].boxes.xyxy        # (N, 4)
             if len(kps_all) > 0:
-                areas   = (boxes_all[:, 2] - boxes_all[:, 0]) * (boxes_all[:, 3] - boxes_all[:, 1])
-                best    = int(areas.argmax())
-                kp_raw   = kps_all[best].cpu().numpy()
-                bbox_raw = boxes_all[best].cpu().numpy()
+                areas     = (boxes_all[:, 2] - boxes_all[:, 0]) * (boxes_all[:, 3] - boxes_all[:, 1])
+                best      = int(areas.argmax())
+                kp_raw_px   = kps_all[best].cpu().numpy()   # PIXEL coords (x, y, conf)
+                bbox_raw_px = boxes_all[best].cpu().numpy()  # PIXEL coords [x1,y1,x2,y2]
 
         result = {
             "label":         "No person detected",
@@ -109,28 +117,40 @@ class BoxingInferenceEngine:
             "bbox":          None,
         }
 
-        if kp_raw is not None:
-            result["keypoints"] = kp_raw
-            result["bbox"]      = bbox_raw
+        if kp_raw_px is not None:
+            result["keypoints"] = kp_raw_px
+            result["bbox"]      = bbox_raw_px
 
-            seq = self.buf.push(
-                normalise_keypoints(kp_raw, w, h),
-                normalise_bbox(bbox_raw, w, h),
-            )
+            # Pass RAW PIXEL arrays — FeatureBuffer handles normalisation internally
+            # and computes motion metrics in pixel space (matching training scale).
+            seq = self.buf.push(kp_raw_px, bbox_raw_px, w, h)
 
             if seq is None:
                 needed = SEQUENCE_LENGTH - len(self.buf._buf)
-                result["label"] = f"Collecting frames… ({needed} more)"
+                if needed > 0:
+                    result["label"] = f"Collecting frames… ({needed} more)"
+                else:
+                    result["label"] = "Idle"
             else:
                 x = torch.tensor(seq, dtype=torch.float32, device=DEVICE)
                 with torch.no_grad():
                     logits, _ = self.lstm(x)
                 probs = torch.softmax(logits[0], dim=0).cpu().numpy()
-                best  = int(np.argmax(probs))
+                raw_best = int(np.argmax(probs))
 
-                result["label"]         = CLASS_NAMES[best]
-                result["confidence"]    = float(probs[best])
-                result["probabilities"] = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+                # ── Confidence gate ────────────────────────────────────────
+                # If model is uncertain (probs near-uniform ≈ 1/8 = 0.125),
+                # suppress prediction → "Idle". Avoids random-class spam.
+                if float(probs[raw_best]) < CONFIDENCE_THRESHOLD:
+                    result["label"]      = "Idle"
+                    result["confidence"] = float(probs[raw_best])
+                    result["probabilities"] = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+                else:
+                    # ── Temporal vote smoothing ────────────────────────────
+                    smoothed = self.buf.apply_vote(raw_best)
+                    result["label"]         = CLASS_NAMES[smoothed]
+                    result["confidence"]    = float(probs[smoothed])
+                    result["probabilities"] = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
 
         result["fps"] = 1.0 / (time.perf_counter() - t0 + 1e-9)
         return result
