@@ -15,24 +15,33 @@
   h1  { font-size: 1.6rem; margin-bottom: 4px; letter-spacing: 2px; }
   .sub { color: #888; font-size: 0.8rem; margin-bottom: 16px; }
 
-  /* arena — stacks video + overlay canvas */
   .arena { position: relative; width: 640px; max-width: 100%; }
-  #vid   { width: 100%; border-radius: 8px; display: block; background: #111; transform: scaleX(-1); }
+
+  /* actual video feed — CSS mirrored for natural selfie */
+  #vid {
+    width: 100%; border-radius: 8px; display: block;
+    background: #111; transform: scaleX(-1);
+  }
+
+  /* skeleton overlay — absolute on top of video */
   #overlay {
     position: absolute; top: 0; left: 0;
     width: 100%; height: 100%;
-    pointer-events: none;
+    pointer-events: none; border-radius: 8px;
   }
 
   /* label banner */
   #banner {
     position: absolute; top: 0; left: 0; right: 0;
-    background: rgba(0,0,0,0.72);
+    background: rgba(0,0,0,0.75);
     padding: 8px 14px; border-radius: 8px 8px 0 0;
     display: flex; justify-content: space-between; align-items: center;
   }
   #label { font-size: 1.3rem; font-weight: 700; letter-spacing: 1px; }
-  #fps   { font-size: 0.75rem; color: #aaa; }
+  .fps-group { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+  .fps-line { font-size: 0.72rem; color: #aaa; }
+  #fps-server { color: #6af; }
+  #fps-client { color: #8f8; }
 
   /* confidence bar */
   #conf-wrap { height: 6px; background: #222; overflow: hidden; }
@@ -48,6 +57,14 @@
   .prob-bar-wrap { background: #2a2a2a; border-radius: 4px; height: 8px; overflow: hidden; }
   .prob-bar  { height: 100%; width: 0%; border-radius: 4px; transition: width 0.12s; }
   .prob-val  { font-size: 0.7rem; color: #ccc; margin-top: 2px; text-align: right; }
+
+  /* body-visible hint */
+  #body-hint {
+    position: absolute; bottom: 8px; left: 0; right: 0;
+    text-align: center; font-size: 0.72rem;
+    color: #fa0; display: none;
+    text-shadow: 0 1px 4px #000;
+  }
 
   /* controls */
   #controls { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
@@ -65,26 +82,28 @@
 <p class="sub">YOLO Pose · BiLSTM · Server-Side Inference</p>
 
 <div class="arena">
-  <!-- live webcam feed (CSS-mirrored for natural selfie view) -->
   <video id="vid" autoplay playsinline muted></video>
-  <!-- skeleton drawn here by JS using keypoints returned from server -->
   <canvas id="overlay"></canvas>
   <div id="banner">
     <span id="label">Starting…</span>
-    <span id="fps">-- fps</span>
+    <div class="fps-group">
+      <span class="fps-line" id="fps-server">server: -- fps</span>
+      <span class="fps-line" id="fps-client">capture: -- fps</span>
+    </div>
   </div>
   <div id="conf-wrap"><div id="conf-bar"></div></div>
+  <div id="body-hint">⚠ Step back so your full body is visible</div>
 </div>
 
 <div id="probs"></div>
 
 <div id="controls">
   <button onclick="resetBuf()">🔄 Reset Buffer</button>
-  <button onclick="toggleCam()">📷 Pause / Resume</button>
+  <button onclick="togglePause()">⏸ Pause / Resume</button>
 </div>
 <p id="status">Opening camera…</p>
 
-<!-- hidden canvas used ONLY for frame capture — not shown to user -->
+<!-- hidden canvas: captures raw (non-mirrored) frame for server -->
 <canvas id="cap" style="display:none"></canvas>
 
 <script>
@@ -118,70 +137,68 @@ const overlay  = document.getElementById('overlay');
 const oc       = overlay.getContext('2d');
 const cap      = document.getElementById('cap');
 const capCtx   = cap.getContext('2d');
+const hint     = document.getElementById('body-hint');
 
 // ── state ──────────────────────────────────────────────────────────────────
-let running    = true;
-let inflight   = false;
-let lastResult = null;
-let frameCount = 0, fpsTime = performance.now();
-let animId     = null;
+let paused    = false;
+let inflight  = false;
+
+// client-side fps counter (how many frames we actually SEND per second)
+let sentCount = 0, fpsTimer = performance.now();
 
 // ── COCO-17 skeleton connections ───────────────────────────────────────────
 const SKEL = [
-  [0,1],[0,2],[1,3],[2,4],          // head
-  [5,6],[5,7],[7,9],[6,8],[8,10],   // arms
-  [5,11],[6,12],[11,12],            // torso
-  [11,13],[13,15],[12,14],[14,16],  // legs
+  [0,1],[0,2],[1,3],[2,4],
+  [5,6],[5,7],[7,9],[6,8],[8,10],
+  [5,11],[6,12],[11,12],
+  [11,13],[13,15],[12,14],[14,16],
 ];
 
-// ── draw skeleton on overlay canvas ───────────────────────────────────────
+// ── draw skeleton ──────────────────────────────────────────────────────────
 function drawSkeleton(kp) {
-  // kp: [[x_px, y_px, conf], ...]  17 points, in RAW (non-mirrored) pixel coords
-  // The video is CSS-mirrored (transform:scaleX(-1)), so we mirror x here too.
+  // kp: [[x_px, y_px, conf] × 17] in server pixel coords (non-mirrored)
+  // video is CSS-mirrored, so we mirror x here to match
   const W = overlay.width;
-  const mirror = ([x, y, c]) => [W - x, y, c];
+  const mx = x => W - x;
 
   oc.clearRect(0, 0, overlay.width, overlay.height);
 
   // bones
-  oc.strokeStyle = '#00e676';
-  oc.lineWidth   = 2.5;
+  oc.strokeStyle = '#00e676'; oc.lineWidth = 2.5;
   SKEL.forEach(([a, b]) => {
-    const [ax, ay, ac] = mirror(kp[a]);
-    const [bx, by, bc] = mirror(kp[b]);
+    const [ax,ay,ac] = kp[a], [bx,by,bc] = kp[b];
     if (ac > 0.3 && bc > 0.3) {
-      oc.beginPath();
-      oc.moveTo(ax, ay);
-      oc.lineTo(bx, by);
-      oc.stroke();
+      oc.beginPath(); oc.moveTo(mx(ax), ay); oc.lineTo(mx(bx), by); oc.stroke();
     }
   });
 
   // joints
-  kp.forEach(pt => {
-    const [x, y, c] = mirror(pt);
+  kp.forEach(([x, y, c]) => {
     if (c > 0.3) {
-      oc.beginPath();
-      oc.arc(x, y, 4, 0, 2 * Math.PI);
-      oc.fillStyle = '#ffeb3b';
-      oc.fill();
+      oc.beginPath(); oc.arc(mx(x), y, 4, 0, 2 * Math.PI);
+      oc.fillStyle = '#ffeb3b'; oc.fill();
     }
   });
+
+  // body-visible hint: ankles (idx 15,16) must be seen for good inference
+  const anklesVisible = kp[15][2] > 0.3 || kp[16][2] > 0.3;
+  hint.style.display = anklesVisible ? 'none' : 'block';
 }
 
-// ── update label / bars ────────────────────────────────────────────────────
-function drawOverlay(r) {
+// ── update label / confidence / prob bars ──────────────────────────────────
+function updateUI(r) {
   const lbl = r.label || '';
-  const isIdle = lbl === 'idle' || lbl === 'Idle'
-               || lbl.startsWith('Collecting') || lbl.startsWith('collecting')
-               || lbl === 'No person detected';
-  const colour      = isIdle ? '#555' : (COLOURS[lbl] || '#ccc');
-  const displayText = isIdle
-    ? (lbl.startsWith('collect') || lbl.startsWith('Collect') ? lbl.toUpperCase() : 'IDLE')
-    : lbl.replace(/_/g, ' ').toUpperCase();
+  const isIdle = ['idle','Idle','No person detected'].includes(lbl)
+               || lbl.toLowerCase().startsWith('collect');
 
-  document.getElementById('label').textContent  = displayText;
+  const colour = isIdle ? '#555' : (COLOURS[lbl] || '#ccc');
+  const text   = isIdle
+    ? (lbl.toLowerCase().startsWith('collect') ? lbl.toUpperCase() : 'IDLE')
+    : lbl.replace(/_/g,' ').toUpperCase();
+
+  document.getElementById('label').textContent = text;
   document.getElementById('label').style.color  = colour;
+
   const bar = document.getElementById('conf-bar');
   bar.style.width      = isIdle ? '0%' : (r.confidence * 100).toFixed(1) + '%';
   bar.style.background = colour;
@@ -192,59 +209,72 @@ function drawOverlay(r) {
     document.getElementById('val-' + cls).textContent = p.toFixed(1) + '%';
   });
 
+  // server-side inference fps
+  if (r.fps && r.fps > 0)
+    document.getElementById('fps-server').textContent = `server: ${r.fps.toFixed(1)} fps`;
+
   if (r.keypoints) drawSkeleton(r.keypoints);
   else oc.clearRect(0, 0, overlay.width, overlay.height);
 }
 
-// ── capture one frame → JPEG blob ─────────────────────────────────────────
-function captureBlob(quality = 0.7) {
+// ── capture frame → JPEG blob (320×240 for fast upload + YOLO speed) ──────
+const SEND_W = 320, SEND_H = 240;   // server sees this resolution
+function captureBlob() {
   return new Promise(resolve => {
-    cap.width  = vid.videoWidth  || 640;
-    cap.height = vid.videoHeight || 480;
-    capCtx.drawImage(vid, 0, 0, cap.width, cap.height);
-    cap.toBlob(resolve, 'image/jpeg', quality);
+    cap.width  = SEND_W;
+    cap.height = SEND_H;
+    // draw un-mirrored (normal orientation) so YOLO sees natural body
+    capCtx.drawImage(vid, 0, 0, SEND_W, SEND_H);
+    cap.toBlob(resolve, 'image/jpeg', 0.6);   // 0.6 quality ≈ 8–12 KB per frame
   });
 }
 
-// ── POST frame to /predict ─────────────────────────────────────────────────
+// ── send one frame, await response (true backpressure) ────────────────────
 async function sendFrame() {
-  if (inflight || !running) return;
-  if (!vid.videoWidth) return;          // camera not ready yet
-
+  if (paused || inflight || !vid.videoWidth) return;
   inflight = true;
+
   try {
-    const blob = await captureBlob(0.75);   // ~25 KB per frame at 640×480
+    const blob = await captureBlob();
     const fd   = new FormData();
-    fd.append('frame', blob, 'frame.jpg');
+    fd.append('frame', blob, 'f.jpg');
 
     const res = await fetch('/predict', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    lastResult = await res.json();
+    if (!res.ok) { document.getElementById('status').textContent = `Server error ${res.status}`; return; }
+
+    const r = await res.json();
     document.getElementById('status').textContent = '';
 
-    // sync overlay canvas size to video element's rendered size
+    // sync overlay canvas to displayed video size (CSS may scale it)
     overlay.width  = vid.videoWidth;
     overlay.height = vid.videoHeight;
 
-    drawOverlay(lastResult);
+    updateUI(r);
 
-    // FPS from server (includes YOLO + LSTM time)
-    if (lastResult.fps)
-      document.getElementById('fps').textContent = lastResult.fps.toFixed(0) + ' fps';
+    // client fps counter
+    sentCount++;
+    const now = performance.now();
+    if (now - fpsTimer >= 1000) {
+      document.getElementById('fps-client').textContent =
+        `capture: ${(sentCount * 1000 / (now - fpsTimer)).toFixed(1)} fps`;
+      sentCount = 0; fpsTimer = now;
+    }
   } catch (e) {
-    document.getElementById('status').textContent = 'Server error: ' + e.message;
+    document.getElementById('status').textContent = 'Server unreachable — retrying…';
   } finally {
     inflight = false;
   }
 }
 
-// ── inference loop — fires as fast as server can keep up ──────────────────
-function loop() {
-  sendFrame();
-  animId = requestAnimationFrame(loop);
+// ── inference loop ─────────────────────────────────────────────────────────
+// Uses setInterval at 100ms (10 fps cap) instead of rAF (60 fps).
+// True backpressure: inflight flag ensures we never queue up requests.
+// On fast hardware this runs at server inference speed; on slow CPU ~2-4 fps.
+function startLoop() {
+  setInterval(sendFrame, 100);   // attempt every 100ms; inflight guard skips if busy
 }
 
-// ── camera start ───────────────────────────────────────────────────────────
+// ── camera ─────────────────────────────────────────────────────────────────
 async function startCam() {
   document.getElementById('status').textContent = 'Opening camera…';
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -254,25 +284,24 @@ async function startCam() {
   vid.srcObject = stream;
   await vid.play();
 
-  // sync overlay dimensions once video metadata is known
   overlay.width  = vid.videoWidth  || 640;
   overlay.height = vid.videoHeight || 480;
 
-  document.getElementById('status').textContent = 'Live ✓  —  stand 2–3 m from camera';
-  loop();
+  document.getElementById('status').textContent =
+    'Live ✓  —  step back so your FULL BODY is visible';
+  startLoop();
 }
 
-function toggleCam() {
-  running = !running;
-  document.getElementById('status').textContent = running ? 'Resumed' : 'Paused';
+function togglePause() {
+  paused = !paused;
+  document.getElementById('status').textContent = paused ? 'Paused' : 'Resumed';
 }
 
 async function resetBuf() {
   await fetch('/reset', { method: 'POST' });
-  lastResult = null;
   oc.clearRect(0, 0, overlay.width, overlay.height);
-  document.getElementById('label').textContent = 'Buffer reset';
-  document.getElementById('conf-bar').style.width = '0%';
+  document.getElementById('label').textContent     = 'Buffer reset';
+  document.getElementById('conf-bar').style.width  = '0%';
   CLASSES.forEach(cls => {
     document.getElementById('bar-' + cls).style.width = '0%';
     document.getElementById('val-' + cls).textContent = '0%';
