@@ -1,67 +1,44 @@
----
-title: Boxing Judge
-emoji: 🥊
-colorFrom: red
-colorTo: gray
-sdk: gradio
-sdk_version: 4.44.0
-app_file: app.py
-pinned: false
-license: mit
----
+# Boxing action inference service
 
-# Boxing Judge — Real-Time Punch Classifier
+This repository serves `best_boxing_model.pth` as a warm-started FastAPI web service suitable for Render. The service loads the checkpoint and YOLO pose detector once during process startup, validates the classifier state-dict architecture, switches both models to inference mode, and warms both before readiness is reported.
 
-Live boxing action recognition from your webcam.
+## Model contract
 
-## Pipeline
+The checkpoint was trained by the notebook in this repository with:
 
-```
-Webcam frame
-    │
-    ▼
-YOLOv8-nano-pose  →  17 keypoints + bounding box
-    │
-    ▼
-Feature extractor  →  63-dim vector per frame
-    │
-    ▼
-Sliding window (16 frames)
-    │
-    ▼
-Bidirectional LSTM + Attention  →  8-class softmax
-    │
-    ▼
-Overlay + probability bars
+- sequence shape: `(16, 63)`
+- 51 raw COCO-17 keypoint values, followed by 4 raw bbox values, followed by 8 motion values
+- two explicit bidirectional LSTM blocks with hidden size 128 and attention
+- eight classes, in the exact `labels.json` order
+
+The notebook uses raw detector pixel coordinates. Do not normalize the first 55 values. A frame can be supplied as:
+
+- `detection`: 55 values `[x1,y1,x2,y2, kp0_x,kp0_y,kp0_conf, ... kp16_x,kp16_y,kp16_conf]`; motion is computed server-side from adjacent frames, or
+- `keypoints` (51) + `bbox` (4), with optional notebook-shaped `motion_metrics`, or
+- `features`: a precomputed 63-value vector.
+
+The API requires exactly 16 frames for the feature endpoint. This is deliberate: padding or silently selecting a window can change the model's output. The `/v1/predict/frame` endpoint accepts one JPEG/PNG/WebP webcam frame at a time, runs YOLOv8-nano-pose, keeps an isolated expiring buffer per `X-Session-ID`, and starts returning predictions after 16 accepted detections.
+
+## Run locally
+
+```powershell
+python -m venv .venv
+.\\.venv\\Scripts\\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --host 127.0.0.1 --port 10000
 ```
 
-## Classes
+Open `http://127.0.0.1:10000/` for the static test client. API documentation is at `/docs`.
 
-| Label | Description |
-|-------|-------------|
-| `jab_left` | Left jab |
-| `jab_right` | Right jab |
-| `hook_left` | Left hook |
-| `hook_right` | Right hook |
-| `uppercut_left` | Left uppercut |
-| `uppercut_right` | Right uppercut |
-| `body_hook_left` | Left body hook |
-| `body_hook_right` | Right body hook |
+The browser client uses the live webcam endpoint. For machine clients, the outer `features` list must contain 16 rows and every row must contain 63 finite numbers. A frame request is sent as multipart form data with a required `X-Session-ID` header.
 
-## Usage
+## Deploy to Render
 
-1. Allow browser webcam access.
-2. Stand 2–3 m from the camera so your full upper body is visible.
-3. Throw punches — predictions appear with a confidence bar and per-class probabilities.
-4. Click **Reset frame buffer** if you want to clear the rolling window.
+1. Push this repository, including `best_boxing_model.pth`, to the Git provider connected to Render.
+2. Create a Blueprint using `render.yaml`, or create a Python web service with the same build/start commands.
+3. Set `CORS_ORIGINS` only if a separate frontend needs cross-origin access; leave it unset for the bundled same-origin client.
+4. Verify `/health/ready`, `/v1/metadata`, and a known 16-frame request after deploy.
 
-## Model details
+The service is intentionally configured with one worker. Multiple workers would load a separate model copy per process and defeat the single-process warm-start/memory budget. Scale horizontally with Render instances when needed.
 
-- **Backbone**: YOLOv8-nano-pose (keypoint extraction)
-- **Classifier**: 2-layer Bidirectional LSTM + temporal attention head
-- **Input**: 63 features × 16 frames
-  - 51 normalised keypoint coords (17 pts × x, y, conf)
-  - 4 normalised bounding-box coords
-  - 8 boxing-specific motion metrics
-- **Parameters**: ~2.8 M
-- **Inference**: ~15–25 fps on CPU (HF free tier)
+The Render build downloads `yolov8n-pose.pt` into the service image. If the exact detector used to create the training `.npy` files is available, set `POSE_MODEL_PATH` to that artifact instead; using a different detector can change feature distributions and accuracy.

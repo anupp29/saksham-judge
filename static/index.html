@@ -1,316 +1,51 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Boxing Judge</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: #0a0a0a; color: #eee;
-    font-family: 'Segoe UI', sans-serif;
-    display: flex; flex-direction: column; align-items: center;
-    min-height: 100vh; padding: 20px;
-  }
-  h1  { font-size: 1.6rem; margin-bottom: 4px; letter-spacing: 2px; }
-  .sub { color: #888; font-size: 0.8rem; margin-bottom: 16px; }
-
-  .arena { position: relative; width: 640px; max-width: 100%; }
-
-  /* actual video feed — CSS mirrored for natural selfie */
-  #vid {
-    width: 100%; border-radius: 8px; display: block;
-    background: #111; transform: scaleX(-1);
-  }
-
-  /* skeleton overlay — absolute on top of video */
-  #overlay {
-    position: absolute; top: 0; left: 0;
-    width: 100%; height: 100%;
-    pointer-events: none; border-radius: 8px;
-  }
-
-  /* label banner */
-  #banner {
-    position: absolute; top: 0; left: 0; right: 0;
-    background: rgba(0,0,0,0.75);
-    padding: 8px 14px; border-radius: 8px 8px 0 0;
-    display: flex; justify-content: space-between; align-items: center;
-  }
-  #label { font-size: 1.3rem; font-weight: 700; letter-spacing: 1px; }
-  .fps-group { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
-  .fps-line { font-size: 0.72rem; color: #aaa; }
-  #fps-server { color: #6af; }
-  #fps-client { color: #8f8; }
-
-  /* confidence bar */
-  #conf-wrap { height: 6px; background: #222; overflow: hidden; }
-  #conf-bar  { height: 100%; width: 0%; transition: width 0.1s, background 0.2s; }
-
-  /* prob table */
-  #probs {
-    margin-top: 12px; width: 640px; max-width: 100%;
-    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
-  }
-  .prob-row  { background: #161616; border-radius: 6px; padding: 6px 10px; }
-  .prob-name { font-size: 0.72rem; color: #aaa; margin-bottom: 3px; }
-  .prob-bar-wrap { background: #2a2a2a; border-radius: 4px; height: 8px; overflow: hidden; }
-  .prob-bar  { height: 100%; width: 0%; border-radius: 4px; transition: width 0.12s; }
-  .prob-val  { font-size: 0.7rem; color: #ccc; margin-top: 2px; text-align: right; }
-
-  /* body-visible hint */
-  #body-hint {
-    position: absolute; bottom: 8px; left: 0; right: 0;
-    text-align: center; font-size: 0.72rem;
-    color: #fa0; display: none;
-    text-shadow: 0 1px 4px #000;
-  }
-
-  /* controls */
-  #controls { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
-  button {
-    background: #1f1f1f; border: 1px solid #333; color: #ccc;
-    padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 0.85rem;
-  }
-  button:hover { background: #2a2a2a; }
-  #status { color: #666; font-size: 0.75rem; margin-top: 8px; text-align: center; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Boxing Action Inference</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --muted:#8b949e; --accent:#ff6b35; --ok:#3fb950; }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; font:15px/1.5 system-ui,sans-serif; color:var(--text); background:radial-gradient(circle at 80% 0,#35160d 0,transparent 38%),var(--bg); }
+    main { width:min(1100px,calc(100% - 32px)); margin:0 auto; padding:42px 0 64px; } .eyebrow { color:var(--accent); text-transform:uppercase; letter-spacing:.13em; font-size:12px; font-weight:700; }
+    h1 { margin:8px 0; font-size:clamp(30px,5vw,52px); line-height:1.05; } .lead { color:var(--muted); max-width:760px; font-size:17px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:28px; } .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px; box-shadow:0 16px 50px #0003; }
+    h2 { margin:0 0 10px; font-size:18px; } video { width:100%; display:block; aspect-ratio:4/3; object-fit:cover; background:#05070a; border-radius:10px; transform:scaleX(-1); } canvas { display:none; }
+    button { border:0; border-radius:9px; padding:11px 16px; font-weight:700; cursor:pointer; color:#fff; background:var(--accent); } button.secondary { color:var(--text); background:#21262d; border:1px solid var(--line); } button:disabled { opacity:.45; cursor:not-allowed; } .actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:12px; }
+    #status { color:var(--muted); margin-top:12px; } .status-ok { color:var(--ok)!important; } pre { margin:0; min-height:300px; overflow:auto; padding:14px; white-space:pre-wrap; word-break:break-word; background:#0d1117; border-radius:10px; color:#b6e3b6; }
+    .note { color:var(--muted); font-size:13px; margin-top:15px; } code { color:#ffab70; } @media(max-width:800px){ .grid{grid-template-columns:1fr;} }
+  </style>
 </head>
 <body>
-
-<h1>🥊 BOXING JUDGE</h1>
-<p class="sub">YOLO Pose · BiLSTM · Server-Side Inference</p>
-
-<div class="arena">
-  <video id="vid" autoplay playsinline muted></video>
-  <canvas id="overlay"></canvas>
-  <div id="banner">
-    <span id="label">Starting…</span>
-    <div class="fps-group">
-      <span class="fps-line" id="fps-server">server: -- fps</span>
-      <span class="fps-line" id="fps-client">capture: -- fps</span>
-    </div>
+<main>
+  <div class="eyebrow">Warm-started PyTorch service</div>
+  <h1>Boxing action inference</h1>
+  <p class="lead">Live webcam frames are converted to COCO-17 pose detections on the server, buffered into the model's required 16-frame window, and classified with the trained checkpoint.</p>
+  <div class="grid">
+    <section class="panel">
+      <h2>Live webcam</h2>
+      <video id="video" autoplay muted playsinline></video><canvas id="canvas"></canvas>
+      <div class="actions"><button id="start">Start webcam</button><button class="secondary" id="stop" disabled>Stop</button><button class="secondary" id="reset" disabled>Reset buffer</button></div>
+      <div id="status">Camera is off.</div>
+      <p class="note">Use a well-lit view with the full upper body visible. The first 16 accepted detections fill the temporal buffer; predictions then update continuously.</p>
+    </section>
+    <section class="panel"><h2>Latest response</h2><pre id="response">Start the webcam to begin.</pre></section>
   </div>
-  <div id="conf-wrap"><div id="conf-bar"></div></div>
-  <div id="body-hint">⚠ Step back so your full body is visible</div>
-</div>
-
-<div id="probs"></div>
-
-<div id="controls">
-  <button onclick="resetBuf()">🔄 Reset Buffer</button>
-  <button onclick="togglePause()">⏸ Pause / Resume</button>
-</div>
-<p id="status">Opening camera…</p>
-
-<!-- hidden canvas: captures raw (non-mirrored) frame for server -->
-<canvas id="cap" style="display:none"></canvas>
-
+</main>
 <script>
-// ── class colours ──────────────────────────────────────────────────────────
-const COLOURS = {
-  jab_left:        '#ff6464',
-  jab_right:       '#64ff64',
-  hook_left:       '#ffc800',
-  hook_right:      '#00c8ff',
-  uppercut_left:   '#c800ff',
-  uppercut_right:  '#ff9632',
-  body_hook_left:  '#32ffc8',
-  body_hook_right: '#c832ff',
-};
-const CLASSES = Object.keys(COLOURS);
-
-// ── build prob rows ────────────────────────────────────────────────────────
-const probsDiv = document.getElementById('probs');
-CLASSES.forEach(cls => {
-  probsDiv.innerHTML += `
-    <div class="prob-row" id="row-${cls}">
-      <div class="prob-name">${cls.replace(/_/g,' ')}</div>
-      <div class="prob-bar-wrap"><div class="prob-bar" id="bar-${cls}" style="background:${COLOURS[cls]}"></div></div>
-      <div class="prob-val" id="val-${cls}">0%</div>
-    </div>`;
-});
-
-// ── DOM refs ───────────────────────────────────────────────────────────────
-const vid      = document.getElementById('vid');
-const overlay  = document.getElementById('overlay');
-const oc       = overlay.getContext('2d');
-const cap      = document.getElementById('cap');
-const capCtx   = cap.getContext('2d');
-const hint     = document.getElementById('body-hint');
-
-// ── state ──────────────────────────────────────────────────────────────────
-let paused    = false;
-let inflight  = false;
-
-// client-side fps counter (how many frames we actually SEND per second)
-let sentCount = 0, fpsTimer = performance.now();
-
-// ── COCO-17 skeleton connections ───────────────────────────────────────────
-const SKEL = [
-  [0,1],[0,2],[1,3],[2,4],
-  [5,6],[5,7],[7,9],[6,8],[8,10],
-  [5,11],[6,12],[11,12],
-  [11,13],[13,15],[12,14],[14,16],
-];
-
-// ── draw skeleton ──────────────────────────────────────────────────────────
-function drawSkeleton(kp) {
-  // kp: [[x_px, y_px, conf] × 17] in server pixel coords (non-mirrored)
-  // video is CSS-mirrored, so we mirror x here to match
-  const W = overlay.width;
-  const mx = x => W - x;
-
-  oc.clearRect(0, 0, overlay.width, overlay.height);
-
-  // bones
-  oc.strokeStyle = '#00e676'; oc.lineWidth = 2.5;
-  SKEL.forEach(([a, b]) => {
-    const [ax,ay,ac] = kp[a], [bx,by,bc] = kp[b];
-    if (ac > 0.3 && bc > 0.3) {
-      oc.beginPath(); oc.moveTo(mx(ax), ay); oc.lineTo(mx(bx), by); oc.stroke();
-    }
-  });
-
-  // joints
-  kp.forEach(([x, y, c]) => {
-    if (c > 0.3) {
-      oc.beginPath(); oc.arc(mx(x), y, 4, 0, 2 * Math.PI);
-      oc.fillStyle = '#ffeb3b'; oc.fill();
-    }
-  });
-
-  // body-visible hint: ankles (idx 15,16) must be seen for good inference
-  const anklesVisible = kp[15][2] > 0.3 || kp[16][2] > 0.3;
-  hint.style.display = anklesVisible ? 'none' : 'block';
-}
-
-// ── update label / confidence / prob bars ──────────────────────────────────
-function updateUI(r) {
-  const lbl = r.label || '';
-  const isIdle = ['idle','Idle','No person detected'].includes(lbl)
-               || lbl.toLowerCase().startsWith('collect');
-
-  const colour = isIdle ? '#555' : (COLOURS[lbl] || '#ccc');
-  const text   = isIdle
-    ? (lbl.toLowerCase().startsWith('collect') ? lbl.toUpperCase() : 'IDLE')
-    : lbl.replace(/_/g,' ').toUpperCase();
-
-  document.getElementById('label').textContent = text;
-  document.getElementById('label').style.color  = colour;
-
-  const bar = document.getElementById('conf-bar');
-  bar.style.width      = isIdle ? '0%' : (r.confidence * 100).toFixed(1) + '%';
-  bar.style.background = colour;
-
-  CLASSES.forEach(cls => {
-    const p = (r.probabilities?.[cls] || 0) * 100;
-    document.getElementById('bar-' + cls).style.width = p.toFixed(1) + '%';
-    document.getElementById('val-' + cls).textContent = p.toFixed(1) + '%';
-  });
-
-  // server-side inference fps
-  if (r.fps && r.fps > 0)
-    document.getElementById('fps-server').textContent = `server: ${r.fps.toFixed(1)} fps`;
-
-  if (r.keypoints) drawSkeleton(r.keypoints);
-  else oc.clearRect(0, 0, overlay.width, overlay.height);
-}
-
-// ── capture frame → JPEG blob (320×240 for fast upload + YOLO speed) ──────
-const SEND_W = 320, SEND_H = 240;   // server sees this resolution
-function captureBlob() {
-  return new Promise(resolve => {
-    cap.width  = SEND_W;
-    cap.height = SEND_H;
-    // draw un-mirrored (normal orientation) so YOLO sees natural body
-    capCtx.drawImage(vid, 0, 0, SEND_W, SEND_H);
-    cap.toBlob(resolve, 'image/jpeg', 0.6);   // 0.6 quality ≈ 8–12 KB per frame
-  });
-}
-
-// ── send one frame, await response (true backpressure) ────────────────────
-async function sendFrame() {
-  if (paused || inflight || !vid.videoWidth) return;
-  inflight = true;
-
-  try {
-    const blob = await captureBlob();
-    const fd   = new FormData();
-    fd.append('frame', blob, 'f.jpg');
-
-    const res = await fetch('/predict', { method: 'POST', body: fd });
-    if (!res.ok) { document.getElementById('status').textContent = `Server error ${res.status}`; return; }
-
-    const r = await res.json();
-    document.getElementById('status').textContent = '';
-
-    // sync overlay canvas to displayed video size (CSS may scale it)
-    overlay.width  = vid.videoWidth;
-    overlay.height = vid.videoHeight;
-
-    updateUI(r);
-
-    // client fps counter
-    sentCount++;
-    const now = performance.now();
-    if (now - fpsTimer >= 1000) {
-      document.getElementById('fps-client').textContent =
-        `capture: ${(sentCount * 1000 / (now - fpsTimer)).toFixed(1)} fps`;
-      sentCount = 0; fpsTimer = now;
-    }
-  } catch (e) {
-    document.getElementById('status').textContent = 'Server unreachable — retrying…';
-  } finally {
-    inflight = false;
+  const video=document.querySelector('#video'), canvas=document.querySelector('#canvas'), responseBox=document.querySelector('#response'), statusBox=document.querySelector('#status');
+  const startButton=document.querySelector('#start'), stopButton=document.querySelector('#stop'), resetButton=document.querySelector('#reset');
+  let stream=null, running=false, busy=false, timer=null; const sessionId=crypto.randomUUID();
+  function status(message,ok=false){statusBox.textContent=message;statusBox.className=ok?'status-ok':'';}
+  async function sendFrame(){
+    if(!running||busy||video.readyState<2)return; busy=true;
+    canvas.width=video.videoWidth||640; canvas.height=video.videoHeight||480; const ctx=canvas.getContext('2d'); ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    try { const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.78)); const r=await fetch('/v1/predict/frame?top_k=3',{method:'POST',headers:{'X-Session-ID':sessionId},body:blob}); const data=await r.json(); responseBox.textContent=JSON.stringify(data,null,2); if(data.status==='prediction')status(`${data.prediction.label} — ${(data.prediction.confidence*100).toFixed(1)}%`,true); else if(data.status==='buffering')status(`Collecting frames: ${data.buffered_frames}/${data.required_frames}`); else status('No person detected; buffer reset.'); }
+    catch(error){ responseBox.textContent=String(error); status('Inference request failed.'); } finally { busy=false; if(running)timer=setTimeout(sendFrame,100); }
   }
-}
-
-// ── inference loop ─────────────────────────────────────────────────────────
-// Uses setInterval at 100ms (10 fps cap) instead of rAF (60 fps).
-// True backpressure: inflight flag ensures we never queue up requests.
-// On fast hardware this runs at server inference speed; on slow CPU ~2-4 fps.
-function startLoop() {
-  setInterval(sendFrame, 100);   // attempt every 100ms; inflight guard skips if busy
-}
-
-// ── camera ─────────────────────────────────────────────────────────────────
-async function startCam() {
-  document.getElementById('status').textContent = 'Opening camera…';
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-    audio: false,
-  });
-  vid.srcObject = stream;
-  await vid.play();
-
-  overlay.width  = vid.videoWidth  || 640;
-  overlay.height = vid.videoHeight || 480;
-
-  document.getElementById('status').textContent =
-    'Live ✓  —  step back so your FULL BODY is visible';
-  startLoop();
-}
-
-function togglePause() {
-  paused = !paused;
-  document.getElementById('status').textContent = paused ? 'Paused' : 'Resumed';
-}
-
-async function resetBuf() {
-  await fetch('/reset', { method: 'POST' });
-  oc.clearRect(0, 0, overlay.width, overlay.height);
-  document.getElementById('label').textContent     = 'Buffer reset';
-  document.getElementById('conf-bar').style.width  = '0%';
-  CLASSES.forEach(cls => {
-    document.getElementById('bar-' + cls).style.width = '0%';
-    document.getElementById('val-' + cls).textContent = '0%';
-  });
-}
-
-startCam().catch(e => {
-  document.getElementById('status').textContent = 'Camera error: ' + e.message;
-});
+  startButton.onclick=async()=>{ try { stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false}); video.srcObject=stream; running=true; startButton.disabled=true; stopButton.disabled=false; resetButton.disabled=false; status('Camera started; warming detector…'); sendFrame(); } catch(error){status(`Camera permission failed: ${error.message}`);} };
+  stopButton.onclick=()=>{running=false;clearTimeout(timer);if(stream)stream.getTracks().forEach(track=>track.stop());video.srcObject=null;stream=null;startButton.disabled=false;stopButton.disabled=true;resetButton.disabled=true;status('Camera is off.');};
+  resetButton.onclick=async()=>{await fetch('/v1/reset',{method:'POST',headers:{'X-Session-ID':sessionId}});status('Buffer reset.');};
 </script>
 </body>
 </html>

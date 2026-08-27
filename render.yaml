@@ -1,12 +1,22 @@
 services:
   - type: web
-    name: boxing-judge
-    runtime: docker
-    plan: free
-    dockerfilePath: ./Dockerfile
+    name: boxing-action-inference
+    runtime: python
+    plan: starter
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && python scripts/download_pose_model.py
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health/ready
+    autoDeploy: true
     envVars:
-      - key: GRADIO_SERVER_NAME
-        value: "0.0.0.0"
-      - key: GRADIO_SERVER_PORT
-        value: "7860"
-    healthCheckPath: /ping
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: MODEL_PATH
+        value: best_boxing_model.pth
+      - key: POSE_MODEL_PATH
+        value: yolov8n-pose.pt
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: CORS_ORIGINS
+        sync: false
